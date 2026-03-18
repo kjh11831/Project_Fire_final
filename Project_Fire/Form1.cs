@@ -83,6 +83,8 @@ namespace Project_Fire
 
         catch (Exception ex)
         {
-            MessageBox.Show("오류 발생: " + ex.Message);
+                MessageBox.Show($"오류 발생: {ex.Message}");
+            }
+        }
         }
 }
