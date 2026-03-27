@@ -166,17 +166,31 @@ namespace Project_Fire
 
         // --- [3. 세부 로직 함수들] ---
 
-        // 화재 확정 판정 알고리즘
+        // 화재 확정 판정 알고리즘 (3가지 중 2가지 이상 충족 시 화재)
         private bool CheckFireDetection(SensorData data)
         {
-            // 1. 불꽃 센서값이 '1'이면 다른 조건 무시하고 즉시 화재로 간주
-            if (data.Flame == FLAME_DETECTED) return true;
+            int detectionCount = 0; // 충족된 조건의 개수를 셀 변수
 
-            // 2. 불꽃은 없지만 CO2와 온도가 동시에 임계치를 넘으면 화재로 간주 (복합 판정)
-            bool highCO2 = double.TryParse(data.CO2, out double c) && c >= THRESHOLD_CO2;
-            bool highTemp = double.TryParse(data.Temperature, out double t) && t >= THRESHOLD_TEMP;
+            // 1. 불꽃 감지 체크
+            if (data.Flame == FLAME_DETECTED)
+            {
+                detectionCount++;
+            }
 
-            return highCO2 && highTemp; // 둘 다 높을 때만 true 반환
+            // 2. 이산화탄소(CO2) 농도 체크
+            if (double.TryParse(data.CO2, out double c) && c >= THRESHOLD_CO2)
+            {
+                detectionCount++;
+            }
+
+            // 3. 온도(Temperature) 체크
+            if (double.TryParse(data.Temperature, out double t) && t >= THRESHOLD_TEMP)
+            {
+                detectionCount++;
+            }
+
+            // 최종 판정: 충족된 조건이 2개 이상이면 true(화재), 아니면 false
+            return detectionCount >= 2;
         }
 
         // 화면에 보여줄 센서 데이터 문자열 가공
