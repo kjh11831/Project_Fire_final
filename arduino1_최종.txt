@@ -1,0 +1,191 @@
+/*
+- 지능형 화재 감지 알고리즘
+  단순히 "30도 이상이면 불"이라는 고정 임계값 방식 아님
+  updateAverageTemperature 함수를 통해 최근 60초간의 평균을 계산하고, 이보다 5도 이상 급격히 상승할 때를 화재로 인식함
+  여름철 무더위 등으로 인한 오작동을 방지하는 스마트한 방식
+- 데이터 무결성 보장
+  isnan(temperature) 코드는 하드웨어 센서의 일시적 오류(연결 불량 등)가 발생해도 시스템이 다운되지 않고 직전의 평균 데이터값을 사용하게 하여 24시간 중단 없는 모니터링을 가능하게 함
+- 클라우드 최적화 통신
+  매밀리초(ms) 단위로 데이터를 보내지 않고, 3초 간격 또는 화재 발생 즉시에만 데이터를 전송함
+  네트워크 트래픽을 절약하면서도 긴급 상황에는 즉각 반응하는 효율적인 구조
+*/
+
+/*
+크게 4가지 단계로 작동
+1. 초기화: Wi-Fi 접속, Firebase 서버 연결, 센서(온습도, 불꽃, 가스) 판 설정
+2. 데이터 수집: 1초마다 온도, 연기 상태, 불꽃 감지 여부 확인
+3. 지능형 화재 판단: 단순히 온도만 체크하는 것이 아닌, '평균 온도 대비 급격한 상승'이나 '불꽃 감지'를 종합해 판단
+4. 클라우드 전송: 판단된 결과를 Firebase를 실시간 데이터베이스로 전송하여 C# 관제 프로그램과 연동
+*/
+
+
+// ==========================================
+// [1] 라이브러리 로드 및 초기 설정
+// ==========================================
+#include <ESP8266WiFi.h> // Wi-Fi 연결 라이브러리
+#include <Firebase_ESP_Client.h> // Firebase 데이터 송수신
+#include <DHT.h> // 온습도 센서(DHT11) 제어
+
+// 관제 시스템에서 1번 기기와 2번 기기를 구분하기 위해 경로를 분리함
+#define FIREBASE_PATH "/arduino1" // 데이터가 저장될 서버의 방 이름(경로)
+
+
+// ==========================================
+// [2] 하드웨어 핀(Pin) 및 네트워크 정보 정의
+// ==========================================
+#define DHTPIN D5 // 온습도 센서 -> D5번 핀
+#define DHTTYPE DHT11 // 센서 모델명은 DHT11
+DHT dht(DHTPIN, DHTTYPE); // 센서 객체 생성
+
+#define FLAME_PIN D7 // 불꽃 감지 센서 -> D7번 핀
+#define MQ2_PIN D2 // 가스(연기) 센서 -> D2번 핀
+#define LED_PIN D6 // 경보용 LED -> D6번 핀
+
+#define WIFI_SSID "Galaxy S21 5G40_c9_21" // 접속할 와이파이 이름
+#define WIFI_PASSWORD "14721472" // 와이파이 비밀번호
+
+// Firebase 서버 접속을 위한 고유 주소와 비밀 키
+#define DATABASE_URL "https://projectfire-e50e7-default-rtdb.firebaseio.com"
+#define DATABASE_SECRET "6zja7ZvLbRxEuuTmvulUobmmelYMVnWHWz8g4fCp"
+
+FirebaseData fbdo; // 데이터 전송 결과 저장 객체
+FirebaseAuth auth; // 인증 정보 관리
+FirebaseConfig config; // 서버 설정 정보 관리
+
+
+// ==========================================
+// [3] 데이터 처리 및 변수 설정 (이동 평균 알고리즘)
+// ==========================================
+#define TEMP_WINDOW_SIZE 60 // 최근 60초간의 온도를 기억함
+float tempWindow[TEMP_WINDOW_SIZE]; // 온도 데이터를 담을 배열(바구니)
+int tempIndex = 0, tempFilled = 0;
+float tempSum = 0; // 온도 합계 (평균 계산용)
+
+unsigned long lastMeasurementTime = 0; // 마지막 측정 시간 기록
+unsigned long lastSendTime = 0; // 마지막 서버 전송 시간 기록
+bool lastFireState = false; // 이전 화재 상태 저장 (상태 변화 감지용)
+
+
+// ------------------------------------------
+// WiFi 재연결 함수:
+// Wi-Fi가 끊기면 자동으로 다시 연결함
+// ------------------------------------------
+void ensureWiFiConnected() {
+  if (WiFi.status() == WL_CONNECTED) return;
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  int attempts = 0;
+  while (WiFi.status() != WL_CONNECTED && attempts < 20) {
+    delay(500);
+    attempts++;
+  }
+}
+
+
+// ------------------------------------------
+// 평균 온도 업데이트 함수:
+// 새로운 온도를 받아 평균값을 갱신함 (필터링 역할)
+// ------------------------------------------
+float updateAverageTemperature(float newTemp) {
+  if (tempFilled == TEMP_WINDOW_SIZE) tempSum -= tempWindow[tempIndex]; // 가장 오래된 데이터 제거
+  else tempFilled++;
+  tempWindow[tempIndex] = newTemp; // 새로운 데이터 추가
+  tempSum += newTemp;
+  tempIndex = (tempIndex + 1) % TEMP_WINDOW_SIZE; // 인덱스 순환
+  return tempSum / tempFilled; // 현재까지의 평균 반환
+}
+
+
+// ==========================================
+// [4] 장치 초기 설정 (부팅 시 딱 한 번 실행)
+// ==========================================
+void setup() {
+  Serial.begin(115200); // PC 시리얼 모니터 출력 속도 설정
+  pinMode(LED_PIN, OUTPUT);
+  pinMode(FLAME_PIN, INPUT);
+  pinMode(MQ2_PIN, INPUT); 
+  
+  // LED 초기 상태 설정 (전원을 켜자마자 LED가 켜지는 것 방지)
+  // VCC 방식은 HIGH를 주어야 LED가 꺼짐
+  digitalWrite(LED_PIN, HIGH);
+
+  dht.begin(); // 온습도 센서 작동 시작
+  
+  // Wi-Fi 연결 대기
+  WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+  while (WiFi.status() != WL_CONNECTED) { delay(500); Serial.print("."); }
+  
+  // Firebase 서버 설정 적용
+  config.database_url = DATABASE_URL;
+  config.signer.tokens.legacy_token = DATABASE_SECRET;
+  Firebase.begin(&config, &auth);
+  Firebase.reconnectWiFi(true); // Wi-Fi 자동 재연결 활성화
+}
+
+
+// ==========================================
+// [5] 메인 루프 (무한 반복하며 감시)
+// ==========================================
+void loop() {
+  unsigned long currentMillis = millis(); // 현재 시간 확인
+
+  // 1초(1000ms)마다 센서 값을 읽어옴
+  if (currentMillis - lastMeasurementTime >= 1000) {
+    lastMeasurementTime = currentMillis;
+    ensureWiFiConnected(); // 네트워크 연결 상태 확인
+
+    float temperature = dht.readTemperature(); // 온도 읽기
+
+    // 센서 오류 시(NaN) 평균값으로 대체하여 시스템 멈춤 방지
+    if (isnan(temperature)) temperature = (tempFilled > 0) ? tempSum / tempFilled : 25.0;
+
+    float avgTemp = updateAverageTemperature(temperature); // 평균 온도 갱신
+    int smokeState = digitalRead(MQ2_PIN); // 연기 감지 (LOW일 때 감지됨)
+    int flameState = digitalRead(FLAME_PIN); // 불꽃 감지 (LOW일 때 감지됨)
+
+    // [화재 판단 로직]
+    // 3가지 조건 중 2가지 이상 충족 시 화재로 판단
+    int fireCount = 0;
+
+    // 조건 1: 온도 급상승 (평균보다 5도 이상)
+    if (tempFilled >= 10 && temperature >= avgTemp + 5.0) fireCount++;
+
+    // 조건 2: 불꽃 감지 (LOW일 때 감지됨)
+    if (flameState == LOW) fireCount++;
+
+    // 조건 3: 가스/연기 감지 (LOW일 때 감지됨)
+    if (smokeState == LOW) fireCount++;
+
+    // 최종 판단: 2개 이상일 때만 화재
+    bool isFire = (fireCount >= 2);
+
+    // 현장 알람 제어: 화재 시 LED 켬 (LOW), 정상 시 끔 (HIGH)
+    if (isFire) digitalWrite(LED_PIN, LOW);
+    else digitalWrite(LED_PIN, HIGH);
+
+    // [서버 전송 조건 확인]
+    bool statusChanged = (isFire != lastFireState); // 화재 상태가 변했거나
+    bool intervalReached = (currentMillis - lastSendTime >= 3000); // 3초가 경과했거나
+
+    // 서버에 데이터 전송 (C# 관제 시스템과 형식 통일)
+    if ((statusChanged || intervalReached) && WiFi.status() == WL_CONNECTED) {
+      FirebaseJson json;
+      
+      // 온도 데이터 소수점 1자리까지 전송
+      json.set("Temperature", String(temperature, 1));
+
+      // 연기 상태를 가상 CO2 수치로 변환 (보기 좋게 가공)
+      json.set("CO2", String(smokeState == LOW ? 900 : 400));
+
+      // 불꽃 여부를 "1" 또는 "0" 문자열로 전송
+      json.set("Flame", String(flameState == LOW ? "1" : "0"));
+
+      // Firebase 실시간 데이터베이스 업데이트
+      if (Firebase.RTDB.setJSON(&fbdo, FIREBASE_PATH, &json)) {
+        lastSendTime = currentMillis;
+        lastFireState = isFire; // 상태 저장
+        Serial.println("데이터 전송 성공: " + String(FIREBASE_PATH));
+      }
+    }
+  }
+  delay(1); // 시스템 안정성을 위한 짧은 대기
+}
